@@ -20,6 +20,10 @@ python -m venv .venv
 
 環境變數請參考 `.env.example`。不要提交真正的 LINE Token、密碼或資料庫。
 
+## Cloudflare 網域代理
+
+`worker.js` 只負責將 `bot.steventeng.uk` 的流量串流轉送到 Linode HTTPS 來源；應用程式與學生資料不儲存在 Cloudflare。`wrangler.jsonc` 讓 Cloudflare GitHub Builds 可以驗證並部署這個代理層。
+
 ## 管理員綁定
 
 伺服器設定 `ADMIN_SETUP_TOKEN` 後，由管理員私訊 Bot：
