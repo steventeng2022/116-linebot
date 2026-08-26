@@ -3,6 +3,9 @@ const ORIGIN = "https://lineb.172-235-214-249.sslip.io";
 export default {
   async fetch(request) {
     const incomingUrl = new URL(request.url);
+    if (incomingUrl.pathname === "/") {
+      return Response.redirect(`${incomingUrl.origin}/admin`, 302);
+    }
     const upstreamUrl = new URL(incomingUrl.pathname + incomingUrl.search, ORIGIN);
     const headers = new Headers(request.headers);
 
