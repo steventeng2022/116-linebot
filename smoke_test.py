@@ -26,6 +26,10 @@ def run():
             legacy.commit()
         main.DATABASE_PATH = legacy_path
         main.init_database()
+        with closing(sqlite3.connect(main.DATABASE_PATH)) as database:
+            assert database.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_hours'"
+            ).fetchone()
         with closing(sqlite3.connect(legacy_path)) as migrated:
             columns = [row[1] for row in migrated.execute("PRAGMA table_info(events)")]
         assert "is_broadcast" in columns
@@ -100,6 +104,22 @@ def run():
         main.update_member_admin("user-1", "王大明", "117", 2)
         assert main.get_member("user-1")["seat_number"] == 2
 
+        hour_id = main.add_service_hours(
+            "user-1", "2026-08-25", 2.5, "校慶音控", event_id, "主控台"
+        )
+        assert main.member_service_hours_total("user-1") == 2.5
+        assert main.list_service_hours("user-1", limit=5)[0]["event_title"] == "校慶"
+        main.update_service_hours(
+            hour_id, "user-1", "2026-08-26", 3, "校慶音控支援", event_id, ""
+        )
+        assert main.get_service_hour(hour_id)["hours"] == 3
+        assert main.service_hours_summary()[0]["total_hours"] == 3
+        temporary_hour_id = main.add_service_hours(
+            "user-1", "2026-08-24", 1, "器材整理"
+        )
+        main.delete_service_hours(temporary_hour_id)
+        assert len(main.list_service_hours("user-1")) == 1
+
         token = main.session_cookie("admin", expires=2_000_000_000)
         assert token
 
@@ -123,6 +143,13 @@ def run():
         assert "分工結果" in event_page.body.decode()
         worksheet = main.admin_work_sheet(event_id, request)
         assert "音控主控" in worksheet.body.decode()
+        hours_page = main.admin_service_hours(request)
+        assert "公服時數" in hours_page.body.decode()
+        assert "校慶音控支援" in hours_page.body.decode()
+        hours_edit_page = main.admin_service_hour_edit_page(hour_id, request)
+        assert "修改公服時數" in hours_edit_page.body.decode()
+        hours_export = main.admin_service_hours_export(request)
+        assert "校慶音控支援" in hours_export.body.decode("utf-8-sig")
 
         rendered = main.page_shell("測試", "<p>管理頁</p>")
         assert 'lang="zh-Hant"' in rendered

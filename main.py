@@ -11,6 +11,7 @@ import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs
 
@@ -143,6 +144,20 @@ def init_database():
                 FOREIGN KEY (role_id) REFERENCES work_roles(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS service_hours (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                event_id INTEGER,
+                service_date TEXT NOT NULL,
+                hours REAL NOT NULL CHECK (hours > 0 AND hours <= 24),
+                description TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES members(line_user_id) ON DELETE CASCADE,
+                FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE SET NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_source
                 ON events(source_type, source_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_members_class_seat
@@ -151,6 +166,8 @@ def init_database():
                 ON event_recipients(event_id, delivery_status);
             CREATE INDEX IF NOT EXISTS idx_assignments_event
                 ON assignments(event_id, role_id);
+            CREATE INDEX IF NOT EXISTS idx_service_hours_user_date
+                ON service_hours(user_id, service_date DESC);
             """
         )
         columns = {
@@ -442,6 +459,123 @@ def update_event(event_id, title):
         connection.execute("UPDATE events SET title = ? WHERE id = ?", (title, event_id))
 
 
+def normalize_service_hours(service_date, hours, description, notes=""):
+    try:
+        date.fromisoformat(service_date)
+        hours_value = float(hours)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("日期或時數格式錯誤") from exc
+    description = description.strip()
+    notes = notes.strip()
+    if not 0 < hours_value <= 24:
+        raise ValueError("每筆時數必須大於 0 且不超過 24 小時")
+    if not 1 <= len(description) <= 100 or len(notes) > 200:
+        raise ValueError("服務內容或備註格式錯誤")
+    return service_date, hours_value, description, notes
+
+
+def add_service_hours(user_id, service_date, hours, description, event_id=None, notes=""):
+    service_date, hours, description, notes = normalize_service_hours(
+        service_date, hours, description, notes
+    )
+    if get_member(user_id) is None:
+        raise ValueError("找不到成員")
+    if event_id is not None and get_event(event_id) is None:
+        raise ValueError("找不到活動")
+    with database_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO service_hours
+                (user_id, event_id, service_date, hours, description, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, event_id, service_date, hours, description, notes),
+        )
+        return cursor.lastrowid
+
+
+def get_service_hour(record_id):
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT * FROM service_hours WHERE id = ?", (record_id,)
+        ).fetchone()
+
+
+def list_service_hours(user_id=None, limit=None):
+    query = """
+        SELECT h.id, h.user_id, h.event_id, h.service_date, h.hours,
+               h.description, h.notes, h.created_at, h.updated_at,
+               m.real_name, m.class_name, m.seat_number, e.title AS event_title
+        FROM service_hours h
+        JOIN members m ON m.line_user_id = h.user_id
+        LEFT JOIN events e ON e.id = h.event_id
+    """
+    parameters = []
+    if user_id is not None:
+        query += " WHERE h.user_id = ?"
+        parameters.append(user_id)
+    query += " ORDER BY h.service_date DESC, h.id DESC"
+    if limit is not None:
+        query += " LIMIT ?"
+        parameters.append(limit)
+    with database_connection() as connection:
+        return connection.execute(query, parameters).fetchall()
+
+
+def service_hours_summary():
+    with database_connection() as connection:
+        return connection.execute(
+            """
+            SELECT m.line_user_id, m.real_name, m.class_name, m.seat_number,
+                   COALESCE(SUM(h.hours), 0) AS total_hours,
+                   COUNT(h.id) AS record_count
+            FROM members m
+            LEFT JOIN service_hours h ON h.user_id = m.line_user_id
+            GROUP BY m.line_user_id
+            ORDER BY total_hours DESC, m.class_name COLLATE NOCASE,
+                     m.seat_number, m.real_name COLLATE NOCASE
+            """
+        ).fetchall()
+
+
+def update_service_hours(record_id, user_id, service_date, hours, description, event_id=None, notes=""):
+    service_date, hours, description, notes = normalize_service_hours(
+        service_date, hours, description, notes
+    )
+    if get_member(user_id) is None:
+        raise ValueError("找不到成員")
+    if event_id is not None and get_event(event_id) is None:
+        raise ValueError("找不到活動")
+    with database_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE service_hours SET user_id = ?, event_id = ?, service_date = ?,
+                hours = ?, description = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (user_id, event_id, service_date, hours, description, notes, record_id),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("找不到時數紀錄")
+
+
+def delete_service_hours(record_id):
+    with database_connection() as connection:
+        connection.execute("DELETE FROM service_hours WHERE id = ?", (record_id,))
+
+
+def member_service_hours_total(user_id):
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT COALESCE(SUM(hours), 0) FROM service_hours WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()[0]
+
+
+def format_hours(value):
+    return f"{float(value):g}"
+
+
 def delete_event(event_id):
     with database_connection() as connection:
         connection.execute("DELETE FROM events WHERE id = ?", (event_id,))
@@ -610,6 +744,7 @@ def update_member_admin(user_id, real_name, class_name, seat_number):
 
 def delete_member_admin(user_id):
     with database_connection() as connection:
+        connection.execute("DELETE FROM service_hours WHERE user_id = ?", (user_id,))
         connection.execute("DELETE FROM availability WHERE user_id = ?", (user_id,))
         connection.execute("DELETE FROM assignments WHERE user_id = ?", (user_id,))
         connection.execute("DELETE FROM event_recipients WHERE user_id = ?", (user_id,))
@@ -727,7 +862,7 @@ def admin_navigation(request):
     token = html.escape(csrf_token(request), quote=True)
     return f"""<header class="admin-nav"><a class="brand" href="/admin">🎛️ 音控管理</a>
     <nav><a href="/admin/members">成員</a><a href="/admin/events">活動</a>
-    <a href="/admin/roles">工作類別</a><a href="/admin/export.csv">匯出成員</a></nav>
+    <a href="/admin/roles">工作類別</a><a href="/admin/hours">公服時數</a><a href="/admin/export.csv">匯出成員</a></nav>
     <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{token}"><button class="secondary" type="submit">登出</button></form></header>"""
 
 
@@ -796,17 +931,19 @@ def admin_dashboard(request: Request):
     members = list_members()
     events = list_events()
     roles = list_work_roles()
+    hours_total = sum(row["total_hours"] for row in service_hours_summary())
     latest = events[0] if events else None
     latest_card = (
         f'<a class="button" href="/admin/events/{latest["id"]}">查看：{html.escape(latest["title"])}</a>'
         if latest else '<span class="muted">尚未建立活動</span>'
     )
     body = f"""{admin_navigation(request)}<div class="top"><div><h1>最高權限控制台</h1>
-    <div class="muted">管理成員、活動、工作類別、回覆與分工</div></div></div>
+    <div class="muted">管理成員、活動、工作類別、回覆、分工與公服時數</div></div></div>
     <section class="grid">
       <div class="card"><div class="muted">已驗證成員</div><div class="metric">{len(members)}</div><a href="/admin/members">管理成員 →</a></div>
       <div class="card"><div class="muted">活動</div><div class="metric">{len(events)}</div><a href="/admin/events">管理活動 →</a></div>
       <div class="card"><div class="muted">工作類別</div><div class="metric">{len(roles)}</div><a href="/admin/roles">調整工作 →</a></div>
+      <div class="card"><div class="muted">公服總時數</div><div class="metric">{format_hours(hours_total)}</div><a href="/admin/hours">管理時數 →</a></div>
     </section>
     <section class="card"><h2>最新活動</h2>{latest_card}</section>"""
     return HTMLResponse(page_shell("最高權限控制台", body))
@@ -873,6 +1010,152 @@ async def admin_member_delete(user_id: str, request: Request):
     require_csrf(request, values)
     delete_member_admin(user_id)
     return RedirectResponse("/admin/members", status_code=303)
+
+
+def service_hour_form_values(values):
+    user_id = values.get("user_id", [""])[0]
+    service_date = values.get("service_date", [""])[0]
+    hours = values.get("hours", [""])[0]
+    description = values.get("description", [""])[0]
+    notes = values.get("notes", [""])[0]
+    event_value = values.get("event_id", [""])[0]
+    try:
+        event_id = int(event_value) if event_value else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="活動資料錯誤") from exc
+    return user_id, service_date, hours, description, event_id, notes
+
+
+@app.get("/admin/hours", response_class=HTMLResponse)
+def admin_service_hours(request: Request):
+    if not valid_admin_session(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    members = list_members()
+    events = list_events()
+    records = list_service_hours()
+    summary = service_hours_summary()
+    token = html.escape(csrf_token(request), quote=True)
+    member_options = "".join(
+        f'<option value="{html.escape(row["line_user_id"], quote=True)}">'
+        f'{html.escape(row["class_name"])}班 {row["seat_number"]}號－{html.escape(row["real_name"])}</option>'
+        for row in members
+    )
+    event_options = "".join(
+        f'<option value="{row["id"]}">{html.escape(row["title"])}</option>'
+        for row in events
+    )
+    summary_rows = "".join(
+        f"<tr><td><strong>{html.escape(row['real_name'])}</strong></td>"
+        f"<td>{html.escape(row['class_name'])}班 {row['seat_number']}號</td>"
+        f"<td>{format_hours(row['total_hours'])} 小時</td><td>{row['record_count']} 筆</td></tr>"
+        for row in summary
+    ) or '<tr><td colspan="4" class="muted">目前尚無成員</td></tr>'
+    record_rows = "".join(
+        f"<tr><td>{html.escape(row['service_date'])}</td>"
+        f"<td><strong>{html.escape(row['real_name'])}</strong><br><span class=\"muted\">{html.escape(row['class_name'])}班 {row['seat_number']}號</span></td>"
+        f"<td>{format_hours(row['hours'])} 小時</td><td>{html.escape(row['description'])}</td>"
+        f"<td>{html.escape(row['event_title'] or '—')}</td><td>{html.escape(row['notes'] or '—')}</td>"
+        f"<td><a class=\"button small\" href=\"/admin/hours/{row['id']}\">修改</a></td></tr>"
+        for row in records
+    ) or '<tr><td colspan="7" class="muted">尚無公服時數紀錄</td></tr>'
+    disabled = " disabled" if not members else ""
+    body = f"""{admin_navigation(request)}<div class="top"><div><h1>公服時數</h1>
+    <div class="muted">登錄每位成員的公共服務內容與時數，並可連結活動</div></div>
+    <a class="button" href="/admin/hours/export.csv">匯出時數 CSV</a></div>
+    <div class="card"><h2>新增紀錄</h2><form class="inline" method="post" action="/admin/hours"><input type="hidden" name="csrf" value="{token}">
+    <label>成員<select name="user_id" required{disabled}>{member_options}</select></label>
+    <label>日期<input name="service_date" type="date" value="{date.today().isoformat()}" required></label>
+    <label>時數<input name="hours" type="number" min="0.25" max="24" step="0.25" placeholder="例如：2.5" required></label>
+    <label>服務內容<input name="description" placeholder="例如：校慶音控" required maxlength="100"></label>
+    <label>關聯活動（選填）<select name="event_id"><option value="">不指定活動</option>{event_options}</select></label>
+    <label>備註（選填）<input name="notes" maxlength="200"></label><button type="submit"{disabled}>新增紀錄</button></form></div>
+    <div class="card"><h2>成員累計</h2><div class="table-wrap"><table><thead><tr><th>姓名</th><th>班級座號</th><th>累計</th><th>筆數</th></tr></thead><tbody>{summary_rows}</tbody></table></div></div>
+    <div class="card"><h2>所有紀錄</h2><div class="table-wrap"><table><thead><tr><th>日期</th><th>成員</th><th>時數</th><th>服務內容</th><th>活動</th><th>備註</th><th>操作</th></tr></thead><tbody>{record_rows}</tbody></table></div></div>"""
+    return HTMLResponse(page_shell("公服時數", body))
+
+
+@app.post("/admin/hours")
+async def admin_service_hour_create(request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    parsed = service_hour_form_values(values)
+    try:
+        add_service_hours(*parsed)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/admin/hours", status_code=303)
+
+
+@app.get("/admin/hours/export.csv")
+def admin_service_hours_export(request: Request):
+    if not valid_admin_session(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    output = io.StringIO()
+    output.write("\ufeff")
+    writer = csv.writer(output)
+    writer.writerow(["日期", "姓名", "班級", "座號", "時數", "服務內容", "關聯活動", "備註"])
+    for row in list_service_hours():
+        writer.writerow([
+            row["service_date"], row["real_name"], row["class_name"],
+            row["seat_number"], format_hours(row["hours"]), row["description"],
+            row["event_title"] or "", row["notes"],
+        ])
+    return Response(
+        output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=service-hours.csv"},
+    )
+
+
+@app.get("/admin/hours/{record_id}", response_class=HTMLResponse)
+def admin_service_hour_edit_page(record_id: int, request: Request):
+    if not valid_admin_session(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    record = get_service_hour(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="找不到時數紀錄")
+    token = html.escape(csrf_token(request), quote=True)
+    member_options = "".join(
+        f'<option value="{html.escape(row["line_user_id"], quote=True)}" '
+        f'{"selected" if row["line_user_id"] == record["user_id"] else ""}>'
+        f'{html.escape(row["class_name"])}班 {row["seat_number"]}號－{html.escape(row["real_name"])}</option>'
+        for row in list_members()
+    )
+    event_options = "".join(
+        f'<option value="{row["id"]}" {"selected" if row["id"] == record["event_id"] else ""}>'
+        f'{html.escape(row["title"])}</option>' for row in list_events()
+    )
+    body = f"""{admin_navigation(request)}<div class="card"><h1>修改公服時數</h1>
+    <form method="post" action="/admin/hours/{record_id}"><input type="hidden" name="csrf" value="{token}">
+    <label>成員</label><select name="user_id" required>{member_options}</select>
+    <label>日期</label><input name="service_date" type="date" value="{html.escape(record['service_date'], quote=True)}" required>
+    <label>時數</label><input name="hours" type="number" min="0.25" max="24" step="0.25" value="{format_hours(record['hours'])}" required>
+    <label>服務內容</label><input name="description" value="{html.escape(record['description'], quote=True)}" required maxlength="100">
+    <label>關聯活動（選填）</label><select name="event_id"><option value="">不指定活動</option>{event_options}</select>
+    <label>備註（選填）</label><textarea name="notes" maxlength="200">{html.escape(record['notes'])}</textarea>
+    <div class="actions"><button type="submit">儲存修改</button><a class="button secondary" href="/admin/hours">返回</a></div></form></div>
+    <div class="card"><h2>危險操作</h2><form method="post" action="/admin/hours/{record_id}/delete" onsubmit="return confirm('確定刪除這筆公服時數？')"><input type="hidden" name="csrf" value="{token}"><button class="danger" type="submit">刪除紀錄</button></form></div>"""
+    return HTMLResponse(page_shell("修改公服時數", body))
+
+
+@app.post("/admin/hours/{record_id}")
+async def admin_service_hour_update(record_id: int, request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    parsed = service_hour_form_values(values)
+    try:
+        update_service_hours(record_id, *parsed)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/admin/hours", status_code=303)
+
+
+@app.post("/admin/hours/{record_id}/delete")
+async def admin_service_hour_delete(record_id: int, request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    delete_service_hours(record_id)
+    return RedirectResponse("/admin/hours", status_code=303)
 
 
 @app.get("/admin/roles", response_class=HTMLResponse)
@@ -1161,6 +1444,33 @@ if handler is not None:
                 reply(event, TextMessage(text=f"👤 我的資料\n\n姓名：{member['real_name']}\n班級：{member['class_name']}班\n座號：{member['seat_number']}號\n\n如需修改，輸入「身分驗證」重新填寫。"))
             return
 
+        if command in {"公服時數", "我的時數", "/hours"} and user_id:
+            member = get_member(user_id)
+            if member is None:
+                reply(event, TextMessage(text="你尚未完成驗證。請先輸入「身分驗證」。"))
+                return
+            total = member_service_hours_total(user_id)
+            recent = list_service_hours(user_id=user_id, limit=5)
+            if recent:
+                lines = [
+                    f"{row['service_date']}｜{row['description']}｜{format_hours(row['hours'])} 小時"
+                    + (f"（{row['event_title']}）" if row["event_title"] else "")
+                    for row in recent
+                ]
+                recent_text = "\n".join(lines)
+            else:
+                recent_text = "目前尚無紀錄"
+            reply(
+                event,
+                TextMessage(
+                    text=(
+                        f"⏱️ 我的公服時數\n\n姓名：{member['real_name']}\n"
+                        f"累計：{format_hours(total)} 小時\n\n最近紀錄\n{recent_text}"
+                    )
+                ),
+            )
+            return
+
         if user_id and event.source.type == "user":
             session = get_verification_session(user_id)
             if session is not None:
@@ -1223,6 +1533,7 @@ if handler is not None:
                 "🎛️ 音控小幫手\n\n"
                 "身分驗證－填寫姓名、班級與座號\n"
                 "我的資料－查看已填資料\n"
+                "公服時數－查看自己的累計與近期紀錄\n"
                 "/event 活動名稱－建立活動\n"
                 "/list－查看最新活動名單\n"
                 "ping－測試 Bot"
