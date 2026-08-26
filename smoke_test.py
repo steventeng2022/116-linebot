@@ -25,6 +25,9 @@ def run():
         assert member["seat_number"] == 1
         assert main.get_verification_session("user-1") is None
 
+        assert main.claim_initial_admin("admin-1", "管理員") is True
+        assert main.claim_initial_admin("admin-2", "其他人") is False
+
         event_id = main.create_event("group", "group-1", "校慶", "user-1")
         main.save_availability(event_id, "user-1", member["real_name"], "available")
         summary = main.format_availability(main.get_latest_event("group", "group-1"), main.get_availability(event_id))

@@ -111,6 +111,11 @@ def init_database():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_events_source
                 ON events(source_type, source_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_members_class_seat
@@ -286,6 +291,24 @@ def add_admin(user_id, display_name):
             """,
             (user_id, display_name),
         )
+
+
+def claim_initial_admin(user_id, display_name):
+    with database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        used = connection.execute(
+            "SELECT value FROM settings WHERE key = 'admin_setup_used'"
+        ).fetchone()
+        if used is not None:
+            return False
+        connection.execute(
+            "INSERT INTO admins (line_user_id, display_name) VALUES (?, ?)",
+            (user_id, display_name),
+        )
+        connection.execute(
+            "INSERT INTO settings (key, value) VALUES ('admin_setup_used', '1')"
+        )
+        return True
 
 
 def notify_admins(real_name, class_name, seat_number, line_display_name):
@@ -509,8 +532,10 @@ if handler is not None:
                 return
             with ApiClient(configuration) as api_client:
                 display_name = get_display_name(MessagingApi(api_client), event, user_id)
-            add_admin(user_id, display_name)
-            reply(event, TextMessage(text="✅ 已綁定為管理員。之後會收到新的身分驗證通知。"))
+            if not claim_initial_admin(user_id, display_name):
+                reply(event, TextMessage(text="管理員已經完成綁定，此設定代碼已失效。"))
+                return
+            reply(event, TextMessage(text="✅ 已綁定為管理員。此設定代碼現已失效，之後會收到新的身分驗證通知。"))
             return
 
         if command in {"身分驗證", "身份驗證", "開始驗證", "/verify", "/重新驗證"}:
