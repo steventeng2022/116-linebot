@@ -30,6 +30,12 @@ def run():
             assert database.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'service_hours'"
             ).fetchone()
+            assert database.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'web_admins'"
+            ).fetchone()
+            assert database.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'audit_logs'"
+            ).fetchone()
         with closing(sqlite3.connect(legacy_path)) as migrated:
             columns = [row[1] for row in migrated.execute("PRAGMA table_info(events)")]
         assert "is_broadcast" in columns
@@ -53,8 +59,34 @@ def run():
         assert member["seat_number"] == 1
         assert main.get_verification_session("user-1") is None
 
-        assert main.claim_initial_admin("admin-1", "管理員") is True
-        assert main.claim_initial_admin("admin-2", "其他人") is False
+        root_admin = main.get_web_admin("admin")
+        assert root_admin is not None
+        assert main.verify_password("test-password", root_admin["password_hash"])
+        assert not main.verify_password("wrong-password", root_admin["password_hash"])
+        main.create_web_admin(
+            "helper", "helper-password", "協助管理員", "user-1", "admin"
+        )
+        assert main.is_line_admin("user-1") is True
+        assert main.verify_password(
+            "helper-password", main.get_web_admin("helper")["password_hash"]
+        )
+        helper_cookie = main.session_cookie("helper", expires=2_000_000_000)
+        main.update_web_admin(
+            "helper", "第二管理員", "user-1", "new-helper-password"
+        )
+        assert main.verify_password(
+            "new-helper-password", main.get_web_admin("helper")["password_hash"]
+        )
+        main.record_audit("web", "admin", "測試操作", "成功", "127.0.0.1")
+        assert main.list_audit_logs()[0]["action"] == "測試操作"
+        stale_request = Request(
+            {
+                "type": "http", "method": "GET", "path": "/admin",
+                "headers": [(b"cookie", f"lineb_admin={helper_cookie}".encode())],
+                "query_string": b"", "server": ("testserver", 443), "scheme": "https",
+            }
+        )
+        assert main.valid_admin_session(stale_request) is False
 
         roles = main.list_work_roles()
         assert [role["name"] for role in roles] == ["音控", "簡報", "攝影", "機動"]
@@ -139,6 +171,12 @@ def run():
         dashboard = main.admin_dashboard(request)
         assert dashboard.status_code == 200
         assert "最高權限控制台" in dashboard.body.decode()
+        accounts_page = main.admin_accounts(request)
+        assert "第二管理員" in accounts_page.body.decode()
+        account_edit_page = main.admin_account_edit_page("helper", request)
+        assert "設定管理員" in account_edit_page.body.decode()
+        logs_page = main.admin_logs(request)
+        assert "測試操作" in logs_page.body.decode()
         event_page = main.admin_event_detail(event_id, request)
         assert "分工結果" in event_page.body.decode()
         worksheet = main.admin_work_sheet(event_id, request)
@@ -154,6 +192,16 @@ def run():
         rendered = main.page_shell("測試", "<p>管理頁</p>")
         assert 'lang="zh-Hant"' in rendered
         assert "管理頁" in rendered
+
+        main.delete_web_admin("helper")
+        assert main.get_web_admin("helper") is None
+        assert main.is_line_admin("user-1") is False
+        try:
+            main.delete_web_admin("admin")
+            raise AssertionError("last admin should not be removable")
+        except ValueError:
+            pass
+
 
     print("smoke test passed")
 

@@ -42,11 +42,44 @@ DATABASE_PATH = os.getenv("DATABASE_PATH", "lineb.db")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "")
-ADMIN_SETUP_TOKEN = os.getenv("ADMIN_SETUP_TOKEN", "")
 
 app = FastAPI(title="音控小幫手", docs_url=None, redoc_url=None)
 handler = WebhookHandler(CHANNEL_SECRET) if CHANNEL_SECRET else None
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN) if CHANNEL_ACCESS_TOKEN else None
+
+
+def normalize_admin_username(username):
+    username = username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_.@-]{3,32}", username):
+        raise ValueError("帳號須為 3～32 個英文字母、數字或 . _ @ -")
+    return username
+
+
+def hash_password(password, enforce_policy=True):
+    if enforce_policy and not 10 <= len(password) <= 128:
+        raise ValueError("密碼須為 10～128 個字元")
+    if not password or len(password) > 1024:
+        raise ValueError("密碼格式錯誤")
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, dklen=32
+    )
+    return "scrypt$16384$8$1$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+
+def verify_password(password, stored_hash):
+    try:
+        algorithm, n, r, p, salt_value, digest_value = stored_hash.split("$", 5)
+        if algorithm != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_value.encode())
+        expected = base64.urlsafe_b64decode(digest_value.encode())
+        actual = hashlib.scrypt(
+            password.encode("utf-8"), salt=salt, n=int(n), r=int(r), p=int(p), dklen=len(expected)
+        )
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError, binascii.Error):
+        return False
 
 
 @contextmanager
@@ -112,6 +145,28 @@ def init_database():
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS web_admins (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                line_user_id TEXT UNIQUE,
+                session_version INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (line_user_id) REFERENCES members(line_user_id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                actor_type TEXT NOT NULL CHECK (actor_type IN ('web', 'bot', 'system')),
+                actor_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '',
+                ip_address TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -168,6 +223,8 @@ def init_database():
                 ON assignments(event_id, role_id);
             CREATE INDEX IF NOT EXISTS idx_service_hours_user_date
                 ON service_hours(user_id, service_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_created
+                ON audit_logs(id DESC);
             """
         )
         columns = {
@@ -177,6 +234,46 @@ def init_database():
             connection.execute(
                 "ALTER TABLE events ADD COLUMN is_broadcast INTEGER NOT NULL DEFAULT 0"
             )
+        web_admin_count = connection.execute("SELECT COUNT(*) FROM web_admins").fetchone()[0]
+        if web_admin_count == 0 and ADMIN_PASSWORD:
+            username = normalize_admin_username(ADMIN_USERNAME)
+            line_admin = connection.execute(
+                """
+                SELECT a.line_user_id FROM admins a
+                JOIN members m ON m.line_user_id = a.line_user_id
+                ORDER BY a.created_at LIMIT 1
+                """
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO web_admins
+                    (username, password_hash, display_name, line_user_id, created_by)
+                VALUES (?, ?, ?, ?, 'system-migration')
+                """,
+                (
+                    username,
+                    hash_password(ADMIN_PASSWORD, enforce_policy=False),
+                    ADMIN_USERNAME,
+                    line_admin["line_user_id"] if line_admin else None,
+                ),
+            )
+        connection.execute(
+            """
+            DELETE FROM admins
+            WHERE line_user_id NOT IN (
+                SELECT line_user_id FROM web_admins WHERE line_user_id IS NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO admins (line_user_id, display_name)
+            SELECT w.line_user_id, m.line_display_name
+            FROM web_admins w JOIN members m ON m.line_user_id = w.line_user_id
+            WHERE w.line_user_id IS NOT NULL
+            ON CONFLICT(line_user_id) DO UPDATE SET display_name = excluded.display_name
+            """
+        )
         for order, role_name in enumerate(("音控", "簡報", "攝影", "機動"), 1):
             connection.execute(
                 "INSERT OR IGNORE INTO work_roles (name, display_order) VALUES (?, ?)",
@@ -191,6 +288,11 @@ def startup():
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
+    audit_username = (
+        session_username(request)
+        if request.method == "POST" and request.url.path.startswith("/admin")
+        else None
+    )
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
@@ -199,6 +301,15 @@ async def security_headers(request: Request, call_next):
     if request.url.path.startswith("/admin"):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        if request.method == "POST" and request.url.path != "/admin/login":
+            if audit_username:
+                record_audit(
+                    "web",
+                    audit_username,
+                    f"{request.method} {request.url.path}",
+                    f"HTTP {response.status_code}",
+                    request_ip(request),
+                )
     return response
 
 
@@ -343,15 +454,140 @@ def list_members():
         ).fetchall()
 
 
-def add_admin(user_id, display_name):
+def get_web_admin(username):
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT * FROM web_admins WHERE username = ?", (username,)
+        ).fetchone()
+
+
+def list_web_admins():
+    with database_connection() as connection:
+        return connection.execute(
+            """
+            SELECT w.username, w.display_name, w.line_user_id, w.created_by,
+                   w.created_at, w.updated_at, m.real_name, m.class_name, m.seat_number
+            FROM web_admins w
+            LEFT JOIN members m ON m.line_user_id = w.line_user_id
+            ORDER BY w.created_at, w.username
+            """
+        ).fetchall()
+
+
+def create_web_admin(username, password, display_name, line_user_id, created_by):
+    username = normalize_admin_username(username)
+    display_name = display_name.strip()
+    if not 1 <= len(display_name) <= 40:
+        raise ValueError("顯示名稱須為 1～40 個字")
+    member = get_member(line_user_id) if line_user_id else None
+    if line_user_id and member is None:
+        raise ValueError("找不到要連結的 LINE 成員")
     with database_connection() as connection:
         connection.execute(
             """
-            INSERT INTO admins (line_user_id, display_name) VALUES (?, ?)
-            ON CONFLICT(line_user_id) DO UPDATE SET display_name = excluded.display_name
+            INSERT INTO web_admins
+                (username, password_hash, display_name, line_user_id, created_by)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, display_name),
+            (username, hash_password(password), display_name, line_user_id or None, created_by),
         )
+        if member is not None:
+            connection.execute(
+                """
+                INSERT INTO admins (line_user_id, display_name) VALUES (?, ?)
+                ON CONFLICT(line_user_id) DO UPDATE SET display_name = excluded.display_name
+                """,
+                (line_user_id, member["line_display_name"]),
+            )
+
+
+def update_web_admin(username, display_name, line_user_id, password=""):
+    display_name = display_name.strip()
+    if not 1 <= len(display_name) <= 40:
+        raise ValueError("顯示名稱須為 1～40 個字")
+    current = get_web_admin(username)
+    if current is None:
+        raise ValueError("找不到管理員")
+    member = get_member(line_user_id) if line_user_id else None
+    if line_user_id and member is None:
+        raise ValueError("找不到要連結的 LINE 成員")
+    password_hash = hash_password(password) if password else current["password_hash"]
+    with database_connection() as connection:
+        connection.execute(
+            """
+            UPDATE web_admins SET display_name = ?, line_user_id = ?,
+                password_hash = ?, session_version = session_version + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE username = ?
+            """,
+            (display_name, line_user_id or None, password_hash, 1 if password else 0, username),
+        )
+        old_line_user_id = current["line_user_id"]
+        if old_line_user_id and old_line_user_id != line_user_id:
+            connection.execute("DELETE FROM admins WHERE line_user_id = ?", (old_line_user_id,))
+        if member is not None:
+            connection.execute(
+                """
+                INSERT INTO admins (line_user_id, display_name) VALUES (?, ?)
+                ON CONFLICT(line_user_id) DO UPDATE SET display_name = excluded.display_name
+                """,
+                (line_user_id, member["line_display_name"]),
+            )
+
+
+def delete_web_admin(username):
+    with database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if connection.execute("SELECT COUNT(*) FROM web_admins").fetchone()[0] <= 1:
+            raise ValueError("至少要保留一個網站管理員")
+        row = connection.execute(
+            "SELECT line_user_id FROM web_admins WHERE username = ?", (username,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("找不到管理員")
+        connection.execute("DELETE FROM web_admins WHERE username = ?", (username,))
+        if row["line_user_id"]:
+            connection.execute("DELETE FROM admins WHERE line_user_id = ?", (row["line_user_id"],))
+
+
+def record_audit(actor_type, actor_id, action, details="", ip_address=""):
+    try:
+        with database_connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO audit_logs
+                    (actor_type, actor_id, action, details, ip_address)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (actor_type, str(actor_id or "unknown")[:100], action[:100], details[:500], ip_address[:64]),
+            )
+    except Exception:
+        return
+
+
+def list_audit_logs(limit=500):
+    with database_connection() as connection:
+        return connection.execute(
+            """
+            SELECT a.*, m.real_name, m.class_name, m.seat_number
+            FROM audit_logs a
+            LEFT JOIN members m ON a.actor_type = 'bot' AND m.line_user_id = a.actor_id
+            ORDER BY a.id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+
+def too_many_login_failures(ip_address):
+    with database_connection() as connection:
+        return connection.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = '登入失敗' AND ip_address = ?
+              AND created_at >= datetime('now', '-10 minutes')
+            """,
+            (ip_address,),
+        ).fetchone()[0] >= 10
 
 
 def is_line_admin(user_id):
@@ -361,24 +597,6 @@ def is_line_admin(user_id):
         return connection.execute(
             "SELECT 1 FROM admins WHERE line_user_id = ?", (user_id,)
         ).fetchone() is not None
-
-
-def claim_initial_admin(user_id, display_name):
-    with database_connection() as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        used = connection.execute(
-            "SELECT value FROM settings WHERE key = 'admin_setup_used'"
-        ).fetchone()
-        if used is not None:
-            return False
-        connection.execute(
-            "INSERT INTO admins (line_user_id, display_name) VALUES (?, ?)",
-            (user_id, display_name),
-        )
-        connection.execute(
-            "INSERT INTO settings (key, value) VALUES ('admin_setup_used', '1')"
-        )
-        return True
 
 
 def notify_admins(real_name, class_name, seat_number, line_display_name):
@@ -744,6 +962,7 @@ def update_member_admin(user_id, real_name, class_name, seat_number):
 
 def delete_member_admin(user_id):
     with database_connection() as connection:
+        connection.execute("DELETE FROM admins WHERE line_user_id = ?", (user_id,))
         connection.execute("DELETE FROM service_hours WHERE user_id = ?", (user_id,))
         connection.execute("DELETE FROM availability WHERE user_id = ?", (user_id,))
         connection.execute("DELETE FROM assignments WHERE user_id = ?", (user_id,))
@@ -815,22 +1034,36 @@ def format_availability(event_row, rows):
 
 def session_cookie(username, expires=None):
     expires = expires or int(time.time()) + 8 * 60 * 60
-    payload = f"{username}:{expires}"
+    admin = get_web_admin(username)
+    if admin is None:
+        raise ValueError("找不到管理員")
+    payload = f"{username}:{admin['session_version']}:{expires}"
     signature = hmac.new(ADMIN_SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}:{signature}".encode()).decode()
 
 
-def valid_admin_session(request):
+def session_username(request):
     if not ADMIN_SESSION_SECRET:
-        return False
+        return None
     try:
         raw = base64.urlsafe_b64decode(request.cookies.get("lineb_admin", "").encode()).decode()
-        username, expires, signature = raw.rsplit(":", 2)
-        payload = f"{username}:{expires}"
+        username, version, expires, signature = raw.rsplit(":", 3)
+        payload = f"{username}:{version}:{expires}"
         expected = hmac.new(ADMIN_SESSION_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return username == ADMIN_USERNAME and int(expires) > time.time() and hmac.compare_digest(signature, expected)
+        if int(expires) <= time.time() or not hmac.compare_digest(signature, expected):
+            return None
+        admin = get_web_admin(username)
+        return username if admin is not None and int(version) == admin["session_version"] else None
     except (ValueError, TypeError, UnicodeError, binascii.Error):
-        return False
+        return None
+
+
+def valid_admin_session(request):
+    return session_username(request) is not None
+
+
+def request_ip(request):
+    return request.client.host if request.client else ""
 
 
 def csrf_token(request):
@@ -862,7 +1095,8 @@ def admin_navigation(request):
     token = html.escape(csrf_token(request), quote=True)
     return f"""<header class="admin-nav"><a class="brand" href="/admin">🎛️ 音控管理</a>
     <nav><a href="/admin/members">成員</a><a href="/admin/events">活動</a>
-    <a href="/admin/roles">工作類別</a><a href="/admin/hours">公服時數</a><a href="/admin/export.csv">匯出成員</a></nav>
+    <a href="/admin/roles">工作類別</a><a href="/admin/hours">公服時數</a>
+    <a href="/admin/admins">管理員</a><a href="/admin/logs">操作紀錄</a><a href="/admin/export.csv">匯出成員</a></nav>
     <form method="post" action="/admin/logout"><input type="hidden" name="csrf" value="{token}"><button class="secondary" type="submit">登出</button></form></header>"""
 
 
@@ -901,15 +1135,22 @@ def admin_login_page(request: Request):
 
 @app.post("/admin/login")
 async def admin_login(request: Request):
-    if not ADMIN_PASSWORD or not ADMIN_SESSION_SECRET:
+    if not ADMIN_SESSION_SECRET:
         raise HTTPException(status_code=503, detail="管理員登入尚未設定")
     values = parse_qs((await request.body()).decode("utf-8"))
-    username = values.get("username", [""])[0]
+    username = values.get("username", [""])[0].strip().lower()
     password = values.get("password", [""])[0]
-    if not (secrets.compare_digest(username, ADMIN_USERNAME) and secrets.compare_digest(password, ADMIN_PASSWORD)):
+    if too_many_login_failures(request_ip(request)):
+        body = """<div class="card" style="max-width:430px;margin:8vh auto"><h1>請稍後再試</h1>
+        <p class="error">登入失敗次數過多，請在 10 分鐘後重試。</p></div>"""
+        return HTMLResponse(page_shell("登入暫時受限", body), status_code=429)
+    admin = get_web_admin(username)
+    if admin is None or not verify_password(password, admin["password_hash"]):
+        record_audit("web", username or "unknown", "登入失敗", "帳號或密碼錯誤", request_ip(request))
         body = """<div class="card" style="max-width:430px;margin:8vh auto"><h1>登入失敗</h1>
         <p class="error">帳號或密碼不正確。</p><a class="button" href="/admin/login">重新登入</a></div>"""
         return HTMLResponse(page_shell("登入失敗", body), status_code=401)
+    record_audit("web", username, "登入成功", "", request_ip(request))
     response = RedirectResponse("/admin", status_code=303)
     response.set_cookie("lineb_admin", session_cookie(username), max_age=8 * 60 * 60, httponly=True, secure=True, samesite="strict")
     return response
@@ -932,6 +1173,7 @@ def admin_dashboard(request: Request):
     events = list_events()
     roles = list_work_roles()
     hours_total = sum(row["total_hours"] for row in service_hours_summary())
+    admin_count = len(list_web_admins())
     latest = events[0] if events else None
     latest_card = (
         f'<a class="button" href="/admin/events/{latest["id"]}">查看：{html.escape(latest["title"])}</a>'
@@ -944,9 +1186,134 @@ def admin_dashboard(request: Request):
       <div class="card"><div class="muted">活動</div><div class="metric">{len(events)}</div><a href="/admin/events">管理活動 →</a></div>
       <div class="card"><div class="muted">工作類別</div><div class="metric">{len(roles)}</div><a href="/admin/roles">調整工作 →</a></div>
       <div class="card"><div class="muted">公服總時數</div><div class="metric">{format_hours(hours_total)}</div><a href="/admin/hours">管理時數 →</a></div>
+      <div class="card"><div class="muted">管理員帳號</div><div class="metric">{admin_count}</div><a href="/admin/admins">管理權限 →</a></div>
     </section>
     <section class="card"><h2>最新活動</h2>{latest_card}</section>"""
     return HTMLResponse(page_shell("最高權限控制台", body))
+
+
+@app.get("/admin/admins", response_class=HTMLResponse)
+def admin_accounts(request: Request):
+    if not valid_admin_session(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    accounts = list_web_admins()
+    members = list_members()
+    token = html.escape(csrf_token(request), quote=True)
+    member_options = "".join(
+        f'<option value="{html.escape(row["line_user_id"], quote=True)}">'
+        f'{html.escape(row["class_name"])}班 {row["seat_number"]}號－{html.escape(row["real_name"])}</option>'
+        for row in members
+    )
+    account_rows = "".join(
+        f"<tr><td><strong>{html.escape(row['username'])}</strong></td>"
+        f"<td>{html.escape(row['display_name'])}</td>"
+        f"<td>{html.escape(row['real_name']) + '（' + html.escape(row['class_name']) + '班 ' + str(row['seat_number']) + '號）' if row['real_name'] else '未連結'}</td>"
+        f"<td>{html.escape(row['created_at'])} UTC</td>"
+        f"<td><a class=\"button small\" href=\"/admin/admins/{html.escape(row['username'], quote=True)}\">設定</a></td></tr>"
+        for row in accounts
+    )
+    body = f"""{admin_navigation(request)}<div class="top"><div><h1>管理員與權限</h1>
+    <div class="muted">所有管理員皆可登入網站；連結 LINE 成員後，也能在 Bot 使用管理員指令</div></div></div>
+    <div class="card"><h2>建立管理員帳號</h2><form class="inline" method="post" action="/admin/admins"><input type="hidden" name="csrf" value="{token}">
+    <label>登入帳號<input name="username" required minlength="3" maxlength="32" pattern="[A-Za-z0-9_.@-]+" autocomplete="off"></label>
+    <label>顯示名稱<input name="display_name" required maxlength="40"></label>
+    <label>密碼<input name="password" type="password" required minlength="10" maxlength="128" autocomplete="new-password"></label>
+    <label>LINE Bot 管理權（選填）<select name="line_user_id"><option value="">只管理網站</option>{member_options}</select></label>
+    <button type="submit">建立帳號</button></form></div>
+    <div class="card"><span class="badge">共 {len(accounts)} 位管理員</span><div class="table-wrap"><table><thead><tr><th>帳號</th><th>顯示名稱</th><th>LINE 身分</th><th>建立時間</th><th>操作</th></tr></thead><tbody>{account_rows}</tbody></table></div></div>"""
+    return HTMLResponse(page_shell("管理員與權限", body))
+
+
+@app.post("/admin/admins")
+async def admin_account_create(request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    try:
+        create_web_admin(
+            values.get("username", [""])[0],
+            values.get("password", [""])[0],
+            values.get("display_name", [""])[0],
+            values.get("line_user_id", [""])[0],
+            session_username(request),
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=400, detail="帳號或 LINE 身分已存在，或資料格式不正確") from exc
+    return RedirectResponse("/admin/admins", status_code=303)
+
+
+@app.get("/admin/admins/{username}", response_class=HTMLResponse)
+def admin_account_edit_page(username: str, request: Request):
+    if not valid_admin_session(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    username = username.lower()
+    account = get_web_admin(username)
+    if account is None:
+        raise HTTPException(status_code=404, detail="找不到管理員")
+    token = html.escape(csrf_token(request), quote=True)
+    member_options = "".join(
+        f'<option value="{html.escape(row["line_user_id"], quote=True)}" '
+        f'{"selected" if row["line_user_id"] == account["line_user_id"] else ""}>'
+        f'{html.escape(row["class_name"])}班 {row["seat_number"]}號－{html.escape(row["real_name"])}</option>'
+        for row in list_members()
+    )
+    is_self = session_username(request) == username
+    delete_disabled = " disabled" if is_self else ""
+    body = f"""{admin_navigation(request)}<div class="card"><h1>設定管理員：{html.escape(username)}</h1>
+    <form method="post" action="/admin/admins/{html.escape(username, quote=True)}"><input type="hidden" name="csrf" value="{token}">
+    <label>顯示名稱</label><input name="display_name" value="{html.escape(account['display_name'], quote=True)}" required maxlength="40">
+    <label>LINE Bot 管理權</label><select name="line_user_id"><option value="">只管理網站</option>{member_options}</select>
+    <label>設定新密碼（留空則不變）</label><input name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password">
+    <div class="actions"><button type="submit">儲存設定</button><a class="button secondary" href="/admin/admins">返回</a></div></form></div>
+    <div class="card"><h2>移除管理員</h2><p>移除後，此帳號會立刻無法登入；連結的 LINE Bot 管理權也會撤銷。</p>
+    <form method="post" action="/admin/admins/{html.escape(username, quote=True)}/delete" onsubmit="return confirm('確定移除此管理員？')"><input type="hidden" name="csrf" value="{token}"><button class="danger" type="submit"{delete_disabled}>移除管理員</button></form>
+    {"<p class='muted'>目前登入中的帳號不能移除自己。</p>" if is_self else ""}</div>"""
+    return HTMLResponse(page_shell("設定管理員", body))
+
+
+@app.post("/admin/admins/{username}")
+async def admin_account_update(username: str, request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    try:
+        update_web_admin(
+            username.lower(), values.get("display_name", [""])[0],
+            values.get("line_user_id", [""])[0], values.get("password", [""])[0],
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=400, detail="管理員資料格式錯誤或 LINE 身分已被使用") from exc
+    return RedirectResponse("/admin/admins", status_code=303)
+
+
+@app.post("/admin/admins/{username}/delete")
+async def admin_account_delete(username: str, request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    username = username.lower()
+    if session_username(request) == username:
+        raise HTTPException(status_code=400, detail="不能移除目前登入中的帳號")
+    try:
+        delete_web_admin(username)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return RedirectResponse("/admin/admins", status_code=303)
+
+
+@app.get("/admin/logs", response_class=HTMLResponse)
+def admin_logs(request: Request):
+    if not valid_admin_session(request):
+        return RedirectResponse("/admin/login", status_code=303)
+    rows = list_audit_logs()
+    log_rows = "".join(
+        f"<tr><td>{html.escape(row['created_at'])} UTC</td>"
+        f"<td>{'網站' if row['actor_type'] == 'web' else 'LINE Bot' if row['actor_type'] == 'bot' else '系統'}</td>"
+        f"<td>{html.escape((row['real_name'] + '（' + row['class_name'] + '班 ' + str(row['seat_number']) + '號）') if row['real_name'] else row['actor_id'])}</td>"
+        f"<td>{html.escape(row['action'])}</td><td>{html.escape(row['details'] or '—')}</td>"
+        f"<td>{html.escape(row['ip_address'] or '—')}</td></tr>" for row in rows
+    ) or '<tr><td colspan="6" class="muted">尚無操作紀錄</td></tr>'
+    body = f"""{admin_navigation(request)}<div class="top"><div><h1>操作紀錄</h1>
+    <div class="muted">最近 500 筆網站與 LINE Bot 操作；密碼與訊息內容不會寫入紀錄</div></div></div>
+    <div class="card"><div class="table-wrap"><table><thead><tr><th>時間</th><th>來源</th><th>操作者</th><th>操作</th><th>結果／資訊</th><th>IP</th></tr></thead><tbody>{log_rows}</tbody></table></div></div>"""
+    return HTMLResponse(page_shell("操作紀錄", body))
 
 
 @app.get("/admin/members", response_class=HTMLResponse)
@@ -1402,25 +1769,18 @@ if handler is not None:
         text = event.message.text.strip()
         command = text.lower()
         user_id = getattr(event.source, "user_id", None)
+        record_audit(
+            "bot", user_id or "unknown", "收到 LINE 文字訊息",
+            f"來源：{event.source.type}",
+        )
 
         if command == "ping":
             reply(event, TextMessage(text="pong 🎛️"))
             return
 
         if command.startswith("/設定管理員"):
-            if event.source.type != "user" or not user_id:
-                reply(event, TextMessage(text="請私訊 Bot 設定管理員。"))
-                return
-            supplied = text[len("/設定管理員"):].strip()
-            if not ADMIN_SETUP_TOKEN or not secrets.compare_digest(supplied, ADMIN_SETUP_TOKEN):
-                reply(event, TextMessage(text="管理員設定代碼不正確。"))
-                return
-            with ApiClient(configuration) as api_client:
-                display_name = get_display_name(MessagingApi(api_client), event, user_id)
-            if not claim_initial_admin(user_id, display_name):
-                reply(event, TextMessage(text="管理員已經完成綁定，此設定代碼已失效。"))
-                return
-            reply(event, TextMessage(text="✅ 已綁定為管理員。此設定代碼現已失效，之後會收到新的身分驗證通知。"))
+            record_audit("bot", user_id or "unknown", "嘗試使用舊管理員設定指令", "已拒絕")
+            reply(event, TextMessage(text="管理員帳號與 LINE Bot 權限現在統一由管理網站設定。"))
             return
 
         if command in {"身分驗證", "身份驗證", "開始驗證", "/verify", "/重新驗證"}:
@@ -1489,6 +1849,7 @@ if handler is not None:
                 with ApiClient(configuration) as api_client:
                     line_display_name = get_display_name(MessagingApi(api_client), event, user_id)
                 save_member(user_id, line_display_name, session["real_name"], class_name, seat_number)
+                record_audit("bot", user_id, "完成身分驗證")
                 notify_admins(session["real_name"], class_name, seat_number, line_display_name)
                 reply(event, TextMessage(text=f"✅ 身分資料已送出\n\n姓名：{session['real_name']}\n班級：{class_name}班\n座號：{seat_number}號\n\n管理員已收到資料。"))
                 return
@@ -1506,6 +1867,10 @@ if handler is not None:
                 source_type, source_id, title, user_id, is_broadcast=True
             )
             sent, failed = broadcast_event(event_id, title)
+            record_audit(
+                "bot", user_id, "建立並群發活動",
+                f"活動 #{event_id}；成功 {sent}；失敗 {failed}",
+            )
             reply(
                 event,
                 TextMessage(
@@ -1577,5 +1942,9 @@ if handler is not None:
             with ApiClient(configuration) as api_client:
                 display_name = get_display_name(MessagingApi(api_client), event, user_id)
         save_availability(event_id, user_id, display_name, status)
+        record_audit(
+            "bot", user_id, "回覆活動出席",
+            f"活動 #{event_id}；狀態：{status}",
+        )
         status_text = "✅ 有空" if status == "available" else "❌ 沒空"
         reply(event, TextMessage(text=f"已記錄：{display_name} → {status_text}"))
