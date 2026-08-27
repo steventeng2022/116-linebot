@@ -43,7 +43,7 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "")
 
-app = FastAPI(title="音控小幫手", docs_url=None, redoc_url=None)
+app = FastAPI(title="社群小幫手", docs_url=None, redoc_url=None)
 handler = WebhookHandler(CHANNEL_SECRET) if CHANNEL_SECRET else None
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN) if CHANNEL_ACCESS_TOKEN else None
 
@@ -128,6 +128,8 @@ def init_database():
                 real_name TEXT NOT NULL,
                 class_name TEXT NOT NULL,
                 seat_number INTEGER NOT NULL CHECK (seat_number BETWEEN 1 AND 99),
+                can_receive_line INTEGER NOT NULL DEFAULT 1,
+                claim_code TEXT,
                 verified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -234,6 +236,21 @@ def init_database():
             connection.execute(
                 "ALTER TABLE events ADD COLUMN is_broadcast INTEGER NOT NULL DEFAULT 0"
             )
+        member_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(members)")
+        }
+        if "can_receive_line" not in member_columns:
+            connection.execute(
+                "ALTER TABLE members ADD COLUMN can_receive_line INTEGER NOT NULL DEFAULT 1"
+            )
+        if "claim_code" not in member_columns:
+            connection.execute("ALTER TABLE members ADD COLUMN claim_code TEXT")
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_members_claim_code
+            ON members(claim_code) WHERE claim_code IS NOT NULL
+            """
+        )
         web_admin_count = connection.execute("SELECT COUNT(*) FROM web_admins").fetchone()[0]
         if web_admin_count == 0 and ADMIN_PASSWORD:
             username = normalize_admin_username(ADMIN_USERNAME)
@@ -315,7 +332,7 @@ async def security_headers(request: Request, call_next):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "bot": "音控小幫手", "line_configured": bool(handler and configuration)}
+    return {"status": "ok", "bot": "社群小幫手", "line_configured": bool(handler and configuration)}
 
 
 @app.post("/callback", response_class=PlainTextResponse)
@@ -423,18 +440,127 @@ def save_member(user_id, line_display_name, real_name, class_name, seat_number):
         connection.execute(
             """
             INSERT INTO members
-                (line_user_id, line_display_name, real_name, class_name, seat_number)
-            VALUES (?, ?, ?, ?, ?)
+                (line_user_id, line_display_name, real_name, class_name, seat_number,
+                 can_receive_line, claim_code)
+            VALUES (?, ?, ?, ?, ?, 1, NULL)
             ON CONFLICT(line_user_id) DO UPDATE SET
                 line_display_name = excluded.line_display_name,
                 real_name = excluded.real_name,
                 class_name = excluded.class_name,
                 seat_number = excluded.seat_number,
+                can_receive_line = 1,
+                claim_code = NULL,
                 updated_at = CURRENT_TIMESTAMP
             """,
             (user_id, line_display_name, real_name, class_name, seat_number),
         )
         connection.execute("DELETE FROM verification_sessions WHERE line_user_id = ?", (user_id,))
+
+
+def create_manual_member(real_name, class_name, seat_number):
+    real_name = real_name.strip()
+    class_name = class_name.strip()
+    if not 1 <= len(real_name) <= 40 or not 1 <= len(class_name) <= 20:
+        raise ValueError("姓名或班級格式錯誤")
+    if not 1 <= seat_number <= 99:
+        raise ValueError("座號須為 1～99")
+    user_id = f"manual:{secrets.token_urlsafe(12)}"
+    with database_connection() as connection:
+        while True:
+            claim_code = secrets.token_hex(6).upper()
+            if connection.execute(
+                "SELECT 1 FROM members WHERE claim_code = ?", (claim_code,)
+            ).fetchone() is None:
+                break
+        connection.execute(
+            """
+            INSERT INTO members
+                (line_user_id, line_display_name, real_name, class_name, seat_number,
+                 can_receive_line, claim_code)
+            VALUES (?, '網站手動新增', ?, ?, ?, 0, ?)
+            """,
+            (user_id, real_name, class_name, seat_number, claim_code),
+        )
+    return user_id, claim_code
+
+
+def link_manual_member(claim_code, line_user_id, line_display_name):
+    claim_code = claim_code.strip().upper()
+    if not re.fullmatch(r"[A-F0-9]{12}", claim_code):
+        raise ValueError("綁定代碼格式錯誤")
+    with database_connection() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        manual = connection.execute(
+            "SELECT * FROM members WHERE claim_code = ?", (claim_code,)
+        ).fetchone()
+        if manual is None:
+            raise ValueError("綁定代碼不存在或已使用")
+        if connection.execute(
+            "SELECT 1 FROM members WHERE line_user_id = ?", (line_user_id,)
+        ).fetchone() is not None:
+            raise ValueError("這個 LINE 帳號已經有身分資料")
+        old_user_id = manual["line_user_id"]
+        connection.execute(
+            """
+            INSERT INTO members
+                (line_user_id, line_display_name, real_name, class_name, seat_number,
+                 can_receive_line, claim_code, verified_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, NULL, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                line_user_id, line_display_name, manual["real_name"],
+                manual["class_name"], manual["seat_number"], manual["verified_at"],
+            ),
+        )
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO availability
+                (event_id, user_id, display_name, status, updated_at)
+            SELECT event_id, ?, display_name, status, updated_at
+            FROM availability WHERE user_id = ?
+            """,
+            (line_user_id, old_user_id),
+        )
+        connection.execute("DELETE FROM availability WHERE user_id = ?", (old_user_id,))
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO event_recipients
+                (event_id, user_id, delivery_status, delivered_at)
+            SELECT event_id, ?, 'group-only', delivered_at
+            FROM event_recipients WHERE user_id = ?
+            """,
+            (line_user_id, old_user_id),
+        )
+        connection.execute("DELETE FROM event_recipients WHERE user_id = ?", (old_user_id,))
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO assignments
+                (event_id, user_id, role_id, notes, created_at)
+            SELECT event_id, ?, role_id, notes, created_at
+            FROM assignments WHERE user_id = ?
+            """,
+            (line_user_id, old_user_id),
+        )
+        connection.execute("DELETE FROM assignments WHERE user_id = ?", (old_user_id,))
+        connection.execute(
+            "UPDATE service_hours SET user_id = ? WHERE user_id = ?",
+            (line_user_id, old_user_id),
+        )
+        connection.execute(
+            "UPDATE web_admins SET line_user_id = ? WHERE line_user_id = ?",
+            (line_user_id, old_user_id),
+        )
+        old_admin = connection.execute(
+            "SELECT display_name FROM admins WHERE line_user_id = ?", (old_user_id,)
+        ).fetchone()
+        if old_admin:
+            connection.execute("DELETE FROM admins WHERE line_user_id = ?", (old_user_id,))
+            connection.execute(
+                "INSERT OR REPLACE INTO admins (line_user_id, display_name) VALUES (?, ?)",
+                (line_user_id, line_display_name),
+            )
+        connection.execute("DELETE FROM members WHERE line_user_id = ?", (old_user_id,))
+        return manual["real_name"], manual["class_name"], manual["seat_number"]
 
 
 def get_member(user_id):
@@ -447,7 +573,8 @@ def list_members():
         return connection.execute(
             """
             SELECT line_user_id, real_name, class_name, seat_number,
-                   line_display_name, verified_at, updated_at
+                   line_display_name, can_receive_line, claim_code,
+                   verified_at, updated_at
             FROM members
             ORDER BY class_name COLLATE NOCASE, seat_number, real_name COLLATE NOCASE
             """
@@ -803,7 +930,8 @@ def list_member_recipients():
     with database_connection() as connection:
         return connection.execute(
             """
-            SELECT line_user_id, real_name, class_name, seat_number
+            SELECT line_user_id, real_name, class_name, seat_number,
+                   can_receive_line, claim_code
             FROM members
             ORDER BY class_name COLLATE NOCASE, seat_number, real_name COLLATE NOCASE
             """
@@ -839,12 +967,18 @@ def broadcast_event(event_id, title):
     failed = 0
     if configuration is None:
         for member in recipients:
-            save_recipient(event_id, member["line_user_id"], "failed")
-        return sent, len(recipients)
+            delivery_status = "failed" if member["can_receive_line"] else "group-only"
+            save_recipient(event_id, member["line_user_id"], delivery_status)
+            if member["can_receive_line"]:
+                failed += 1
+        return sent, failed
     with ApiClient(configuration) as api_client:
         api = MessagingApi(api_client)
         for member in recipients:
             user_id = member["line_user_id"]
+            if not member["can_receive_line"]:
+                save_recipient(event_id, user_id, "group-only")
+                continue
             save_recipient(event_id, user_id, "pending")
             try:
                 api.push_message(
@@ -946,6 +1080,46 @@ def get_event_assignments(event_id):
             """,
             (event_id,),
         ).fetchall()
+
+
+def find_members_by_name(real_name):
+    with database_connection() as connection:
+        return connection.execute(
+            """
+            SELECT line_user_id, real_name, class_name, seat_number
+            FROM members WHERE real_name = ?
+            ORDER BY class_name COLLATE NOCASE, seat_number
+            """,
+            (real_name.strip(),),
+        ).fetchall()
+
+
+def get_work_role_by_name(name):
+    with database_connection() as connection:
+        return connection.execute(
+            "SELECT id, name FROM work_roles WHERE name = ?", (name.strip(),)
+        ).fetchone()
+
+
+def format_assignment_sheet(event_row):
+    assignments = get_event_assignments(event_row["id"])
+    lines = [f"🤝 {event_row['title']}－分工表", ""]
+    for role in list_work_roles():
+        people = [row for row in assignments if row["role_id"] == role["id"]]
+        lines.append(f"【{role['name']}】")
+        if people:
+            for row in people:
+                text = f"• {row['real_name']}（{row['class_name']}班 {row['seat_number']}號）"
+                if row["notes"]:
+                    text += f"－{row['notes']}"
+                lines.append(text)
+        else:
+            lines.append("• 尚未安排")
+        lines.append("")
+    result = "\n".join(lines).strip()
+    if len(result) > 4900:
+        result = result[:4860] + "\n\n內容過長，完整版本請至管理網站查看。"
+    return result
 
 
 def update_member_admin(user_id, real_name, class_name, seat_number):
@@ -1093,7 +1267,7 @@ async def form_values(request):
 
 def admin_navigation(request):
     token = html.escape(csrf_token(request), quote=True)
-    return f"""<header class="admin-nav"><a class="brand" href="/admin">🎛️ 音控管理</a>
+    return f"""<header class="admin-nav"><a class="brand" href="/admin">🤝 社群小幫手</a>
     <nav><a href="/admin/members">成員</a><a href="/admin/events">活動</a>
     <a href="/admin/roles">工作類別</a><a href="/admin/hours">公服時數</a>
     <a href="/admin/admins">管理員</a><a href="/admin/logs">操作紀錄</a><a href="/admin/export.csv">匯出成員</a></nav>
@@ -1119,6 +1293,14 @@ button,.button{{display:inline-block;background:var(--brand);color:white;border:
 @media(max-width:600px){{.wrap{{padding:14px 9px}}.card{{padding:15px}}.admin-nav nav{{order:3;width:100%}}}}
 @media print{{body{{background:white}}.admin-nav,.no-print{{display:none!important}}.wrap{{max-width:none;padding:0}}.card{{box-shadow:none;border:0;padding:0}}}}
 </style></head><body><main class="wrap">{body}</main></body></html>"""
+
+
+def member_line_status_html(member):
+    if member["can_receive_line"]:
+        return '<span class="badge">官方帳號</span>'
+    if member["claim_code"]:
+        return f'<span class="badge warn">待綁定：{html.escape(member["claim_code"])}</span>'
+    return '<span class="badge">群組已綁定</span>'
 
 
 @app.get("/admin/login", response_class=HTMLResponse)
@@ -1202,7 +1384,7 @@ def admin_accounts(request: Request):
     member_options = "".join(
         f'<option value="{html.escape(row["line_user_id"], quote=True)}">'
         f'{html.escape(row["class_name"])}班 {row["seat_number"]}號－{html.escape(row["real_name"])}</option>'
-        for row in members
+        for row in members if row["claim_code"] is None
     )
     account_rows = "".join(
         f"<tr><td><strong>{html.escape(row['username'])}</strong></td>"
@@ -1254,7 +1436,7 @@ def admin_account_edit_page(username: str, request: Request):
         f'<option value="{html.escape(row["line_user_id"], quote=True)}" '
         f'{"selected" if row["line_user_id"] == account["line_user_id"] else ""}>'
         f'{html.escape(row["class_name"])}班 {row["seat_number"]}號－{html.escape(row["real_name"])}</option>'
-        for row in list_members()
+        for row in list_members() if row["claim_code"] is None
     )
     is_self = session_username(request) == username
     delete_disabled = " disabled" if is_self else ""
@@ -1321,18 +1503,41 @@ def admin_members(request: Request):
     if not valid_admin_session(request):
         return RedirectResponse("/admin/login", status_code=303)
     rows = list_members()
+    token = html.escape(csrf_token(request), quote=True)
     table_rows = "".join(
         "<tr>"
         f"<td><strong>{html.escape(row['real_name'])}</strong></td>"
         f"<td>{html.escape(row['class_name'])}班</td><td>{row['seat_number']}號</td>"
         f"<td>{html.escape(row['line_display_name'])}</td>"
+        f"<td>{member_line_status_html(row)}</td>"
         f"<td><a class=\"button small\" href=\"/admin/members/{html.escape(row['line_user_id'], quote=True)}\">修改</a></td></tr>"
         for row in rows
-    ) or '<tr><td colspan="5" class="muted">目前尚無驗證資料</td></tr>'
+    ) or '<tr><td colspan="6" class="muted">目前尚無成員資料</td></tr>'
     body = f"""{admin_navigation(request)}<div class="top"><div><h1>成員管理</h1><div class="muted">可修改或刪除任何成員資料</div></div>
-    <a class="button" href="/admin/export.csv">匯出 CSV</a></div><div class="card"><span class="badge">共 {len(rows)} 人</span>
-    <div class="table-wrap"><table><thead><tr><th>姓名</th><th>班級</th><th>座號</th><th>LINE 名稱</th><th>操作</th></tr></thead><tbody>{table_rows}</tbody></table></div></div>"""
+    <a class="button" href="/admin/export.csv">匯出 CSV</a></div>
+    <div class="card"><h2>手動新增成員</h2><p>適用於只加入群組、沒有加官方帳號的人。建立後請把一次性綁定代碼交給本人。</p>
+    <form class="inline" method="post" action="/admin/members"><input type="hidden" name="csrf" value="{token}">
+    <label>姓名<input name="real_name" required maxlength="40"></label><label>班級<input name="class_name" required maxlength="20"></label>
+    <label>座號<input name="seat_number" type="number" min="1" max="99" required></label><button type="submit">新增身分</button></form></div>
+    <div class="card"><span class="badge">共 {len(rows)} 人</span>
+    <div class="table-wrap"><table><thead><tr><th>姓名</th><th>班級</th><th>座號</th><th>LINE 名稱</th><th>LINE 狀態</th><th>操作</th></tr></thead><tbody>{table_rows}</tbody></table></div></div>"""
     return HTMLResponse(page_shell("成員管理", body))
+
+
+@app.post("/admin/members")
+async def admin_member_create(request: Request):
+    values = await form_values(request)
+    require_csrf(request, values)
+    try:
+        seat_number = int(values.get("seat_number", [""])[0])
+        create_manual_member(
+            values.get("real_name", [""])[0],
+            values.get("class_name", [""])[0],
+            seat_number,
+        )
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        raise HTTPException(status_code=400, detail="成員資料格式錯誤") from exc
+    return RedirectResponse("/admin/members", status_code=303)
 
 
 @app.get("/admin/members/{user_id}", response_class=HTMLResponse)
@@ -1344,7 +1549,14 @@ def admin_member_edit_page(user_id: str, request: Request):
         raise HTTPException(status_code=404, detail="找不到成員")
     token = html.escape(csrf_token(request), quote=True)
     uid = html.escape(user_id, quote=True)
+    if member["can_receive_line"]:
+        line_status = "已加入官方帳號，可接收私訊"
+    elif member["claim_code"]:
+        line_status = f"尚未綁定。一次性代碼：<strong>{html.escape(member['claim_code'])}</strong>；請本人在 LINE 群組輸入：/綁定身分 {html.escape(member['claim_code'])}"
+    else:
+        line_status = "已綁定群組 LINE 身分，但未加入官方帳號，因此只會收到群組訊息"
     body = f"""{admin_navigation(request)}<div class="card"><h1>修改成員</h1>
+    <p>{line_status}</p>
     <form method="post" action="/admin/members/{uid}"><input type="hidden" name="csrf" value="{token}">
     <label>姓名</label><input name="real_name" value="{html.escape(member['real_name'], quote=True)}" required maxlength="40">
     <label>班級</label><input name="class_name" value="{html.escape(member['class_name'], quote=True)}" required maxlength="20">
@@ -1756,9 +1968,10 @@ def admin_export(request: Request):
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output)
-    writer.writerow(["姓名", "班級", "座號", "LINE 名稱", "驗證時間", "更新時間"])
+    writer.writerow(["姓名", "班級", "座號", "LINE 名稱", "LINE 狀態", "驗證時間", "更新時間"])
     for row in list_members():
-        writer.writerow([row["real_name"], row["class_name"], row["seat_number"], row["line_display_name"], row["verified_at"], row["updated_at"]])
+        line_status = "官方帳號" if row["can_receive_line"] else "待群組綁定" if row["claim_code"] else "群組已綁定"
+        writer.writerow([row["real_name"], row["class_name"], row["seat_number"], row["line_display_name"], line_status, row["verified_at"], row["updated_at"]])
     return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=members.csv"})
 
 
@@ -1781,6 +1994,32 @@ if handler is not None:
         if command.startswith("/設定管理員"):
             record_audit("bot", user_id or "unknown", "嘗試使用舊管理員設定指令", "已拒絕")
             reply(event, TextMessage(text="管理員帳號與 LINE Bot 權限現在統一由管理網站設定。"))
+            return
+
+        if command.startswith("/綁定身分"):
+            if not user_id:
+                reply(event, TextMessage(text="無法識別你的 LINE 帳號。"))
+                return
+            claim_code = text[len("/綁定身分"):].strip()
+            if not claim_code:
+                reply(event, TextMessage(text="用法：/綁定身分 一次性代碼"))
+                return
+            with ApiClient(configuration) as api_client:
+                line_display_name = get_display_name(MessagingApi(api_client), event, user_id)
+            try:
+                real_name, class_name, seat_number = link_manual_member(
+                    claim_code, user_id, line_display_name
+                )
+            except ValueError as exc:
+                reply(event, TextMessage(text=f"無法綁定：{exc}"))
+                return
+            record_audit("bot", user_id, "綁定網站新增身分")
+            reply(
+                event,
+                TextMessage(
+                    text=f"✅ 身分綁定完成\n\n姓名：{real_name}\n班級：{class_name}班\n座號：{seat_number}號"
+                ),
+            )
             return
 
         if command in {"身分驗證", "身份驗證", "開始驗證", "/verify", "/重新驗證"}:
@@ -1854,6 +2093,80 @@ if handler is not None:
                 reply(event, TextMessage(text=f"✅ 身分資料已送出\n\n姓名：{session['real_name']}\n班級：{class_name}班\n座號：{seat_number}號\n\n管理員已收到資料。"))
                 return
 
+        if command.startswith("/指派"):
+            if not is_line_admin(user_id):
+                reply(event, TextMessage(text="只有管理員可以在 LINE 指派工作。"))
+                return
+            parts = text.split(maxsplit=3)
+            if len(parts) < 3:
+                reply(event, TextMessage(text="用法：/指派 姓名 工作類別 備註（選填）\n例如：/指派 王小明 音控 主控台"))
+                return
+            _, real_name, role_name, *note_parts = parts
+            members = find_members_by_name(real_name)
+            if not members:
+                reply(event, TextMessage(text="找不到這位成員，請先在網站新增身分。"))
+                return
+            if len(members) > 1:
+                reply(event, TextMessage(text="有多位成員同名，請到管理網站指派以避免選錯。"))
+                return
+            role = get_work_role_by_name(role_name)
+            if role is None:
+                reply(event, TextMessage(text="找不到這個工作類別，請先到管理網站新增。"))
+                return
+            source_type, source_id = source_context(event)
+            event_row = get_latest_event(source_type, source_id)
+            if event_row is None:
+                reply(event, TextMessage(text="此聊天室尚無活動，請先輸入：/event 活動名稱"))
+                return
+            member = members[0]
+            if not is_event_recipient(event_row["id"], member["line_user_id"]):
+                save_recipient(event_row["id"], member["line_user_id"], "group-only")
+            notes = note_parts[0].strip()[:100] if note_parts else ""
+            save_assignment(event_row["id"], member["line_user_id"], role["id"], notes)
+            record_audit(
+                "bot", user_id, "LINE 指派工作",
+                f"活動 #{event_row['id']}；工作：{role['name']}；成員：{member['real_name']}",
+            )
+            reply(event, TextMessage(text=f"✅ 已指派：{member['real_name']} → {role['name']}"))
+            return
+
+        if command.startswith("/移除指派"):
+            if not is_line_admin(user_id):
+                reply(event, TextMessage(text="只有管理員可以移除分工。"))
+                return
+            parts = text.split(maxsplit=2)
+            if len(parts) != 3:
+                reply(event, TextMessage(text="用法：/移除指派 姓名 工作類別"))
+                return
+            _, real_name, role_name = parts
+            members = find_members_by_name(real_name)
+            role = get_work_role_by_name(role_name)
+            if len(members) != 1 or role is None:
+                reply(event, TextMessage(text="找不到唯一的成員或工作類別。"))
+                return
+            source_type, source_id = source_context(event)
+            event_row = get_latest_event(source_type, source_id)
+            if event_row is None:
+                reply(event, TextMessage(text="此聊天室尚無活動。"))
+                return
+            delete_assignment(event_row["id"], members[0]["line_user_id"], role["id"])
+            record_audit("bot", user_id, "LINE 移除分工", f"活動 #{event_row['id']}")
+            reply(event, TextMessage(text=f"已移除：{members[0]['real_name']} 的 {role['name']} 分工"))
+            return
+
+        if command in {"/分工表", "/傳送分工表"}:
+            if not is_line_admin(user_id):
+                reply(event, TextMessage(text="只有管理員可以傳送分工表。"))
+                return
+            source_type, source_id = source_context(event)
+            event_row = get_latest_event(source_type, source_id)
+            if event_row is None:
+                reply(event, TextMessage(text="此聊天室尚無活動，請先輸入：/event 活動名稱"))
+                return
+            record_audit("bot", user_id, "傳送 LINE 分工表", f"活動 #{event_row['id']}")
+            reply(event, TextMessage(text=format_assignment_sheet(event_row)))
+            return
+
         if command.startswith("/event"):
             if not is_line_admin(user_id):
                 reply(event, TextMessage(text="只有管理員可以建立並群發活動。"))
@@ -1873,14 +2186,14 @@ if handler is not None:
             )
             reply(
                 event,
-                TextMessage(
+                [TextMessage(
                     text=(
                         f"✅ 已建立活動：{title}\n\n"
                         f"成功私訊：{sent} 人\n"
                         f"傳送失敗：{failed} 人\n\n"
-                        "可到管理網站查看回覆與製作分工表。"
+                        "群組成員可直接按下方按鈕填寫；管理員也可在 LINE 指派工作。"
                     )
-                ),
+                ), build_event_message(event_id, title)],
             )
             return
 
@@ -1895,11 +2208,15 @@ if handler is not None:
 
         if command == "/help":
             reply(event, TextMessage(text=(
-                "🎛️ 音控小幫手\n\n"
+                "🤝 社群小幫手\n\n"
                 "身分驗證－填寫姓名、班級與座號\n"
+                "/綁定身分 代碼－綁定網站新增的身分\n"
                 "我的資料－查看已填資料\n"
                 "公服時數－查看自己的累計與近期紀錄\n"
                 "/event 活動名稱－建立活動\n"
+                "/指派 姓名 工作 備註－在 LINE 製作分工\n"
+                "/移除指派 姓名 工作－移除分工\n"
+                "/分工表－傳送最新活動分工表\n"
                 "/list－查看最新活動名單\n"
                 "ping－測試 Bot"
             )))
@@ -1936,11 +2253,10 @@ if handler is not None:
             reply(event, TextMessage(text="你不在這個活動的填寫名單中。"))
             return
         member = get_member(user_id)
-        if member is not None:
-            display_name = member["real_name"]
-        else:
-            with ApiClient(configuration) as api_client:
-                display_name = get_display_name(MessagingApi(api_client), event, user_id)
+        if member is None:
+            reply(event, TextMessage(text="你尚未綁定身分。請向管理員索取一次性代碼，並輸入：/綁定身分 代碼"))
+            return
+        display_name = member["real_name"]
         save_availability(event_id, user_id, display_name, status)
         record_audit(
             "bot", user_id, "回覆活動出席",

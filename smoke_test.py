@@ -38,7 +38,10 @@ def run():
             ).fetchone()
         with closing(sqlite3.connect(legacy_path)) as migrated:
             columns = [row[1] for row in migrated.execute("PRAGMA table_info(events)")]
+            member_columns = [row[1] for row in migrated.execute("PRAGMA table_info(members)")]
         assert "is_broadcast" in columns
+        assert "can_receive_line" in member_columns
+        assert "claim_code" in member_columns
 
         main.DATABASE_PATH = str(Path(temp_dir) / "test.db")
         main.ADMIN_SESSION_SECRET = "test-session-secret"
@@ -114,6 +117,30 @@ def run():
         assert event_summary["recipient_count"] == 1
         assert event_summary["available_count"] == 1
 
+        manual_id, claim_code = main.create_manual_member("李小華", "118", 3)
+        manual_member = main.get_member(manual_id)
+        assert manual_member["can_receive_line"] == 0
+        assert manual_member["claim_code"] == claim_code
+        assert len(claim_code) == 12
+        assert claim_code in main.member_line_status_html(manual_member)
+        assert main.find_members_by_name("李小華")[0]["line_user_id"] == manual_id
+        assert main.get_work_role_by_name("攝影")["id"] == roles[2]["id"]
+        main.save_recipient(event_id, manual_id, "group-only")
+        main.save_assignment(event_id, manual_id, roles[2]["id"], "側拍")
+        main.add_service_hours(manual_id, "2026-08-25", 1.5, "校慶攝影", event_id)
+        assert "李小華" in main.format_assignment_sheet(main.get_event(event_id))
+        linked_name, linked_class, linked_seat = main.link_manual_member(
+            claim_code, "group-user-1", "Line Group User"
+        )
+        assert (linked_name, linked_class, linked_seat) == ("李小華", "118", 3)
+        assert main.get_member(manual_id) is None
+        linked_member = main.get_member("group-user-1")
+        assert linked_member["can_receive_line"] == 0
+        assert linked_member["claim_code"] is None
+        assert main.is_event_recipient(event_id, "group-user-1") is True
+        assert main.member_service_hours_total("group-user-1") == 1.5
+        assert main.get_event_assignments(event_id)[1]["real_name"] == "李小華"
+
         broadcast_id = main.create_event(
             "admin", "global", "全員測試", "web-admin", is_broadcast=True
         )
@@ -123,6 +150,7 @@ def run():
         main.configuration = original_configuration
         assert (sent, failed) == (0, 1)
         assert main.is_event_recipient(broadcast_id, "user-1") is True
+        assert main.is_event_recipient(broadcast_id, "group-user-1") is True
 
         summary = main.format_availability(main.get_latest_event("group", "group-1"), main.get_availability(event_id))
         assert "有空（1）" in summary and "王小明" in summary
@@ -171,6 +199,9 @@ def run():
         dashboard = main.admin_dashboard(request)
         assert dashboard.status_code == 200
         assert "最高權限控制台" in dashboard.body.decode()
+        members_page = main.admin_members(request)
+        assert "李小華" in members_page.body.decode()
+        assert "群組已綁定" in members_page.body.decode()
         accounts_page = main.admin_accounts(request)
         assert "第二管理員" in accounts_page.body.decode()
         account_edit_page = main.admin_account_edit_page("helper", request)
